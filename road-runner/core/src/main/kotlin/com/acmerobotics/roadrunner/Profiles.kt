@@ -298,6 +298,30 @@ fun profile(
     minAccels: List<Double>,
     maxAccels: List<Double>,
 ): CancelableProfile {
+    require(minAccels.all { a -> a < 0.0 }) { "minAccels must be negative" }
+    require(maxAccels.all { a -> a > 0.0 }) { "maxAccels must be positive" }
+
+    return profileByVel(
+        disps, beginEndVel, maxVels,
+        minAccels.map { a -> { _: Double -> a } },
+        maxAccels.map { a -> { _: Double -> a } },
+    )
+}
+
+/**
+ * Computes an approximately time-optimal profile from center-sampled constraints whose acceleration limits may
+ * additionally depend on the profile velocity. Element `i` of [minAccels] ([maxAccels]) maps a profile velocity to
+ * the negative (positive) acceleration limit over the corresponding displacement interval.
+ *
+ * The minimum accelerations recorded for cancellation are sampled at the base profile velocity of each interval.
+ */
+internal fun profileByVel(
+    disps: List<Double>,
+    beginEndVel: Double,
+    maxVels: List<Double>,
+    minAccels: List<(Double) -> Double>,
+    maxAccels: List<(Double) -> Double>,
+): CancelableProfile {
     require(maxVels.size == minAccels.size) {
         "maxVels.size() (${maxVels.size}) != minAccels.size() (${minAccels.size})"
     }
@@ -305,13 +329,16 @@ fun profile(
         "maxVels.size() (${maxVels.size}) != maxAccels.size() (${maxAccels.size})"
     }
 
-    return CancelableProfile(
-        merge(
-            forwardProfile(disps, beginEndVel, maxVels, maxAccels),
-            backwardProfile(disps, maxVels, beginEndVel, minAccels),
-        ),
-        disps, minAccels
+    val baseProfile = merge(
+        forwardProfileByVel(disps, beginEndVel, maxVels, maxAccels),
+        backwardProfileByVel(disps, maxVels, beginEndVel, minAccels),
     )
+
+    val cancelMinAccels = minAccels.mapIndexed { i, minAccel ->
+        minAccel(baseProfile[0.5 * (disps[i] + disps[i + 1])][1])
+    }
+
+    return CancelableProfile(baseProfile, disps, cancelMinAccels)
 }
 
 /**
@@ -352,16 +379,41 @@ fun forwardProfile(
  * @param[maxVels] all positive
  * @param[maxAccels] all positive
  */
-@Suppress("NAME_SHADOWING")
 fun forwardProfile(
     disps: List<Double>,
     beginVel: Double,
     maxVels: List<Double>,
     maxAccels: List<Double>,
 ): DisplacementProfile {
+    require(maxAccels.all { v -> v > 0.0 }) { "maxAccels must be positive" }
+
+    return forwardProfileByVel(disps, beginVel, maxVels, maxAccels.map { a -> { _: Double -> a } })
+}
+
+/**
+ * Computes an approximately time-optimal forward profile from center-sampled constraints whose acceleration limits
+ * may additionally depend on the profile velocity. Element `i` of [maxAccels] maps a profile velocity to the
+ * positive acceleration limit over the corresponding displacement interval. Within each interval, the acceleration
+ * is sampled at an estimate of the interval's midpoint velocity and held constant.
+ */
+@Suppress("NAME_SHADOWING")
+internal fun forwardProfileByVel(
+    disps: List<Double>,
+    beginVel: Double,
+    maxVels: List<Double>,
+    maxAccels: List<(Double) -> Double>,
+): DisplacementProfile {
     require(beginVel >= 0.0) { "beginVel ($beginVel) must be non-negative" }
     require(maxVels.all { v -> v > 0.0 }) { "maxVels must be positive" }
-    require(maxAccels.all { v -> v > 0.0 }) { "maxAccels must be positive" }
+
+    fun evalAccel(maxAccel: (Double) -> Double, vel: Double): Double {
+        val a = maxAccel(vel)
+        require(a > 0.0) {
+            "acceleration limit ($a) at velocity $vel must be positive; make sure velocity constraints keep the " +
+                "profile below the speed at which the achievable acceleration vanishes"
+        }
+        return a
+    }
 
     val newDisps = mutableListOf(0.0)
     val vels = mutableListOf(beginVel)
@@ -379,17 +431,25 @@ fun forwardProfile(
                 vels.add(maxVel)
                 accels.add(0.0)
             } else {
-                val endVel = sqrt(beginVel * beginVel + 2 * maxAccel * (endDisp - beginDisp))
+                val dx = endDisp - beginDisp
+                // Take the more conservative of the limits at the interval's begin and (estimated) end velocities
+                // so that monotone velocity-dependent limits hold throughout the interval; constant limits are
+                // unaffected.
+                val beginAccel = evalAccel(maxAccel, beginVel)
+                val estEndVel = min(maxVel, sqrt(beginVel * beginVel + 2 * beginAccel * dx))
+                val accel = min(beginAccel, evalAccel(maxAccel, estEndVel))
+
+                val endVel = sqrt(beginVel * beginVel + 2 * accel * dx)
                 if (endVel <= maxVel) {
                     newDisps.add(endDisp)
                     vels.add(endVel)
-                    accels.add(maxAccel)
+                    accels.add(accel)
                 } else {
-                    val accelDx = (maxVel * maxVel - beginVel * beginVel) / (2 * maxAccel)
+                    val accelDx = (maxVel * maxVel - beginVel * beginVel) / (2 * accel)
 
                     newDisps.add(beginDisp + accelDx)
                     vels.add(maxVel)
-                    accels.add(maxAccel)
+                    accels.add(accel)
 
                     newDisps.add(endDisp)
                     vels.add(maxVel)
@@ -445,9 +505,21 @@ fun backwardProfile(
     maxVels: List<Double>,
     endVel: Double,
     minAccels: List<Double>,
-) = forwardProfile(
+) = backwardProfileByVel(disps, maxVels, endVel, minAccels.map { a -> { _: Double -> a } })
+
+/**
+ * Computes an approximately time-optimal backward profile from center-sampled constraints whose acceleration limits
+ * may additionally depend on the profile velocity. Element `i` of [minAccels] maps a profile velocity to the
+ * negative acceleration limit over the corresponding displacement interval.
+ */
+internal fun backwardProfileByVel(
+    disps: List<Double>,
+    maxVels: List<Double>,
+    endVel: Double,
+    minAccels: List<(Double) -> Double>,
+) = forwardProfileByVel(
     disps.reversed().map { disps.last() - it }, endVel,
-    maxVels.reversed(), minAccels.reversed().map { -it }
+    maxVels.reversed(), minAccels.reversed().map { minAccel -> { v: Double -> -minAccel(v) } }
 ).let {
     DisplacementProfile(
         it.disps.map { x -> it.length - x }.reversed(),
@@ -555,6 +627,14 @@ fun interface VelConstraint {
 
 fun interface AccelConstraint {
     fun minMaxProfileAccel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): MinMax
+
+    /**
+     * Velocity-aware variant of [minMaxProfileAccel] queried by the profile generator with the profile velocity
+     * [vel] under consideration. Override to implement constraints that vary with speed (e.g., the acceleration
+     * available from a DC motor falls off linearly with speed due to back-EMF).
+     */
+    fun minMaxProfileAccel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double, vel: Double): MinMax =
+        minMaxProfileAccel(robotPose, path, s)
 }
 
 class TranslationalVelConstraint(
@@ -586,6 +666,35 @@ class MinVelConstraint(
 ) : VelConstraint {
     override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double) =
         constraints.minOf { it.maxRobotVel(robotPose, path, s) }
+}
+
+/**
+ * @usesMathJax
+ *
+ * Constraint limiting the centripetal acceleration of the robot's translation to [maxCentripetalAccel] by enforcing
+ * \(v^2 \kappa \le a_{lat}\), where \(\kappa\) is the curvature of the path. This is a proxy for the lateral traction
+ * limit of the drive, keeping the wheels from slipping sideways through turns.
+ */
+class CentripetalAccelVelConstraint(
+    @JvmField
+    val maxCentripetalAccel: Double,
+) : VelConstraint {
+    init {
+        require(maxCentripetalAccel > 0.0) { "maxCentripetalAccel ($maxCentripetalAccel) must be positive" }
+    }
+
+    override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): Double {
+        val pose = if (robotPose.position.x.size() >= 3) robotPose else path[s, 3]
+        // paths are arclength-parameterized, so the curvature is the norm of the second derivative
+        val curvature = sqrt(
+            pose.position.x[2] * pose.position.x[2] + pose.position.y[2] * pose.position.y[2]
+        )
+        return if (curvature < 1e-6) {
+            Double.POSITIVE_INFINITY
+        } else {
+            sqrt(maxCentripetalAccel / curvature)
+        }
+    }
 }
 
 class ProfileAccelConstraint(
@@ -648,6 +757,16 @@ class CompositeAccelConstraint(
 
         return constraints.first().minMaxProfileAccel(robotPose, path, s)
     }
+
+    override fun minMaxProfileAccel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double, vel: Double): MinMax {
+        for ((offset, constraint) in offsets.zip(constraints).drop(1).reversed()) {
+            if (s >= offset) {
+                return constraint.minMaxProfileAccel(robotPose, path, s, vel)
+            }
+        }
+
+        return constraints.first().minMaxProfileAccel(robotPose, path, s, vel)
+    }
 }
 
 fun samplePathByRotation(
@@ -688,20 +807,18 @@ fun profile(
     val samples = (dispSamples + angSamples).sorted()
 
     val maxVels = mutableListOf<Double>()
-    val minAccels = mutableListOf<Double>()
-    val maxAccels = mutableListOf<Double>()
+    val minAccels = mutableListOf<(Double) -> Double>()
+    val maxAccels = mutableListOf<(Double) -> Double>()
 
     for (s in samples) {
-        val pose = path[s, 2]
+        val pose = path[s, 3]
 
         maxVels.add(velConstraint.maxRobotVel(pose, path, s))
-
-        val (minAccel, maxAccel) = accelConstraint.minMaxProfileAccel(pose, path, s)
-        minAccels.add(minAccel)
-        maxAccels.add(maxAccel)
+        minAccels.add { v -> accelConstraint.minMaxProfileAccel(pose, path, s, v).min }
+        maxAccels.add { v -> accelConstraint.minMaxProfileAccel(pose, path, s, v).max }
     }
 
-    return profile(
+    return profileByVel(
         listOf(0.0) + samples.zip(samples.drop(1)).map { (a, b) -> 0.5 * (a + b) } + listOf(path.length()),
         beginEndVel, maxVels, minAccels, maxAccels
     )
@@ -720,18 +837,16 @@ fun forwardProfile(
     val samples = (dispSamples + angSamples).sorted()
 
     val maxVels = mutableListOf<Double>()
-    val maxAccels = mutableListOf<Double>()
+    val maxAccels = mutableListOf<(Double) -> Double>()
 
     for (s in samples) {
-        val pose = path[s, 2]
+        val pose = path[s, 3]
 
         maxVels.add(velConstraint.maxRobotVel(pose, path, s))
-
-        val (_, maxAccel) = accelConstraint.minMaxProfileAccel(pose, path, s)
-        maxAccels.add(maxAccel)
+        maxAccels.add { v -> accelConstraint.minMaxProfileAccel(pose, path, s, v).max }
     }
 
-    return forwardProfile(
+    return forwardProfileByVel(
         listOf(0.0) + samples.zip(samples.drop(1)).map { (a, b) -> 0.5 * (a + b) } + listOf(path.length()),
         beginVel, maxVels, maxAccels,
     )
@@ -750,18 +865,16 @@ fun backwardProfile(
     val samples = (dispSamples + angSamples).sorted()
 
     val maxVels = mutableListOf<Double>()
-    val minAccels = mutableListOf<Double>()
+    val minAccels = mutableListOf<(Double) -> Double>()
 
     for (s in samples) {
-        val pose = path[s, 2]
+        val pose = path[s, 3]
 
         maxVels.add(velConstraint.maxRobotVel(pose, path, s))
-
-        val (minAccel, _) = accelConstraint.minMaxProfileAccel(pose, path, s)
-        minAccels.add(minAccel)
+        minAccels.add { v -> accelConstraint.minMaxProfileAccel(pose, path, s, v).min }
     }
 
-    return backwardProfile(
+    return backwardProfileByVel(
         listOf(0.0) + samples.zip(samples.drop(1)).map { (a, b) -> 0.5 * (a + b) } + listOf(path.length()),
         maxVels, endVel, minAccels,
     )

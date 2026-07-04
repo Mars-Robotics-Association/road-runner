@@ -32,6 +32,14 @@ java {
     withSourcesJar()
 }
 
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
+    kotlinOptions {
+        // compile interface default methods (e.g., the velocity-aware AccelConstraint method) to JVM default
+        // methods so that Java implementations inherit them
+        freeCompilerArgs += "-Xjvm-default=all"
+    }
+}
+
 tasks.named<Test>("test") {
     useJUnitPlatform()
 }
