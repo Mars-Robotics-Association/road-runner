@@ -91,6 +91,9 @@ private fun maxProfileVelForWheels(
 // signs of the angular column of the mecanum inverse kinematics, in [MecanumKinematics.WheelVelocities] order
 private val mecanumYawSigns = doubleArrayOf(-1.0, -1.0, 1.0, 1.0)
 
+// signs of the angular column of the tank inverse kinematics, in [TankKinematics.WheelVelocities] order
+private val tankYawSigns = doubleArrayOf(-1.0, 1.0)
+
 private fun requireValidVoltageParams(feedforward: MotorFeedforward, maxVoltage: Double, cruiseFraction: Double) {
     require(feedforward.kV > 0.0) { "kV (${feedforward.kV}) must be positive" }
     require(feedforward.kA > 0.0) { "kA (${feedforward.kA}) must be positive" }
@@ -392,6 +395,18 @@ data class TankKinematics(@JvmField val trackWidth: Double) {
         )
     }
 
+    /**
+     * Per-wheel voltages realizing the yaw-mode correction of [coupling] at chassis velocity [vel]; add each to
+     * the corresponding wheel's base feedforward voltage. Entries follow [WheelVelocities] order and carry the
+     * signs of the angular column of [inverse], so the correction is a pure yaw moment (it cancels in the
+     * translational rows of [forward]). Only the axial coupling constants apply: a tank drive has no lateral
+     * motion.
+     */
+    fun yawCouplingVoltages(coupling: YawCouplingFeedforward, vel: PoseVelocity2d): List<Double> {
+        val yawVoltage = coupling.compute(vel.linearVel.x, 0.0)
+        return tankYawSigns.map { it * yawVoltage }
+    }
+
     // TODO: can probably be made generic, though lack of associated types may pose a difficulty
     inner class WheelVelConstraint(@JvmField val maxWheelVel: Double) : VelConstraint {
         override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): Double {
@@ -419,20 +434,59 @@ data class TankKinematics(@JvmField val trackWidth: Double) {
      *
      * The velocity limit only draws [cruiseFraction] of [maxVoltage] so that some acceleration always remains
      * available; without this reserve, reaching the voltage-limited top speed would take unbounded time.
+     *
+     * The [yawCoupling] correction (see [YawCouplingFeedforward]) is included in each wheel's budgeted voltage
+     * with the signs of [yawCouplingVoltages], so a follower applying the correction at runtime stays within the
+     * budget the planner assumed. Its lateral constants must be zero: a tank drive has no lateral motion.
      */
-    inner class WheelVoltageConstraint @JvmOverloads constructor(
+    inner class WheelVoltageConstraint(
         @JvmField val feedforward: MotorFeedforward,
+        @JvmField val yawCoupling: YawCouplingFeedforward,
         @JvmField val maxVoltage: Double,
         @JvmField val cruiseFraction: Double = 0.95,
     ) : VelConstraint, AccelConstraint {
+        @JvmOverloads constructor(
+            feedforward: MotorFeedforward,
+            maxVoltage: Double,
+            cruiseFraction: Double = 0.95,
+        ) : this(feedforward, YawCouplingFeedforward(0.0, 0.0), maxVoltage, cruiseFraction)
+
         init {
             requireValidVoltageParams(feedforward, maxVoltage, cruiseFraction)
+            require(yawCoupling.kSLateral == 0.0 && yawCoupling.kVLateral == 0.0) {
+                "yaw coupling lateral constants (${yawCoupling.kSLateral}, ${yawCoupling.kVLateral}) must be " +
+                    "zero for a tank drive, which has no lateral motion"
+            }
+            require(abs(yawCoupling.kVAxial) < feedforward.kV) {
+                "yaw coupling kVAxial (${yawCoupling.kVAxial}) must be smaller in magnitude than " +
+                    "kV (${feedforward.kV})"
+            }
+            require(maxVoltage * cruiseFraction > feedforward.kS + abs(yawCoupling.kSAxial)) {
+                "maxVoltage ($maxVoltage) times cruiseFraction ($cruiseFraction) must exceed kS plus the " +
+                    "yaw coupling kS magnitude"
+            }
         }
 
         private fun voltageTerms(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): List<WheelVoltageTerm> {
             // the wheel acceleration term requires a second derivative of the pose
             val pose = if (robotPose.position.x.size() >= 3) robotPose else path[s, 3]
-            return inverse(pose.inverse() * pose.velocity()).all().map { wheelVoltageTerm(feedforward, it) }
+            val vel = pose.inverse() * pose.velocity()
+
+            // chassis velocity components scale with the (nonnegative) profile velocity, so the coupling voltage
+            // is affine in it: the sign terms join kS and the linear terms join the velocity coefficient
+            val axialDir = vel.linearVel.x[0]
+            val yawKS = yawCoupling.computeKS(axialDir, 0.0)
+            val yawKV = yawCoupling.kVAxial * axialDir
+
+            return inverse(vel).all().mapIndexed { i, wheelVel ->
+                val base = wheelVoltageTerm(feedforward, wheelVel)
+                WheelVoltageTerm(
+                    base.kSSigned + tankYawSigns[i] * yawKS,
+                    base.velCoeff + tankYawSigns[i] * yawKV,
+                    base.velSqCoeff,
+                    base.accelCoeff,
+                )
+            }
         }
 
         override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double) =

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertTrue
 
 class YawCouplingFeedforwardTest {
@@ -160,6 +161,108 @@ class YawCouplingFeedforwardTest {
         ).baseProfile
 
         val max = maxTotalWheelVoltage(kinematics, path, profile)
+        assertTrue(max > maxVoltage + 0.3, "max wheel voltage: $max")
+    }
+
+    private val tankCoupling = YawCouplingFeedforward(0.4, 0.015)
+
+    @Test
+    fun testTankCorrectionIsPureYaw() {
+        val kinematics = TankKinematics(12.0)
+        val voltages = kinematics.yawCouplingVoltages(tankCoupling, PoseVelocity2d(Vector2d(30.0, 0.0), 2.0))
+
+        // interpret the corrections as wheel motions and map them back through the forward kinematics
+        val twist = kinematics.forward(
+            TankKinematics.WheelIncrements(
+                DualNum.constant<Time>(voltages[0], 1),
+                DualNum.constant(voltages[1], 1),
+            )
+        )
+
+        assertEquals(0.0, twist.line.x[0], 1e-9)
+        // positive yaw-mode voltage demands a counterclockwise moment
+        assertEquals(tankCoupling.compute(30.0, 0.0) / 6.0, twist.angle[0], 1e-9)
+    }
+
+    @Test
+    fun testTankRejectsLateralCoupling() {
+        val kinematics = TankKinematics(12.0)
+        assertFails {
+            kinematics.WheelVoltageConstraint(axialFf, coupling, maxVoltage)
+        }
+    }
+
+    @Test
+    fun testTankZeroCouplingMatchesBaseConstraint() {
+        val kinematics = TankKinematics(12.0)
+        val path = forwardPath()
+
+        fun generate(constraint: TankKinematics.WheelVoltageConstraint) =
+            profile(TEST_PROFILE_PARAMS, path, 0.0, constraint, constraint).baseProfile
+
+        val baseProfile = generate(kinematics.WheelVoltageConstraint(axialFf, maxVoltage))
+        val coupledProfile = generate(
+            kinematics.WheelVoltageConstraint(axialFf, YawCouplingFeedforward(0.0, 0.0), maxVoltage)
+        )
+
+        assertEquals(baseProfile, coupledProfile)
+    }
+
+    private fun maxTotalTankWheelVoltage(
+        kinematics: TankKinematics,
+        path: PosePath,
+        p: DisplacementProfile,
+    ): Double {
+        val traj = DisplacementTrajectory(path, p)
+        var maxWheelVoltage = 0.0
+        for (s in range(0.0, path.length(), 1000)) {
+            val txWorldRobot = traj[s]
+            val vel = txWorldRobot.inverse() * txWorldRobot.velocity()
+            val corrections = kinematics.yawCouplingVoltages(tankCoupling, vel.value())
+            kinematics.inverse(vel).all().forEachIndexed { i, wheelVel ->
+                maxWheelVoltage = maxOf(maxWheelVoltage, abs(axialFf.compute(wheelVel) + corrections[i]))
+            }
+        }
+        return maxWheelVoltage
+    }
+
+    @Test
+    fun testTankCoupledProfileRespectsBudget() {
+        val kinematics = TankKinematics(12.0)
+        val path = forwardPath()
+
+        val constraint = kinematics.WheelVoltageConstraint(axialFf, tankCoupling, maxVoltage)
+        val profile = profile(
+            TEST_PROFILE_PARAMS.copy(dispResolution = 0.05, angResolution = 0.02),
+            path,
+            0.0,
+            constraint,
+            constraint,
+        ).baseProfile
+
+        val max = maxTotalTankWheelVoltage(kinematics, path, profile)
+        assertTrue(max < maxVoltage + 0.1, "max wheel voltage: $max")
+
+        // the profile actually moves the robot at speed (not degenerate)
+        assertTrue(TimeProfile(profile).duration < 15.0)
+    }
+
+    @Test
+    fun testTankUncoupledPlanningViolatesBudget() {
+        val kinematics = TankKinematics(12.0)
+        val path = forwardPath()
+
+        // planning without the coupling leaves no headroom for the correction the follower applies
+        val constraint = kinematics.WheelVoltageConstraint(axialFf, maxVoltage)
+        val profile = profile(
+            TEST_PROFILE_PARAMS.copy(dispResolution = 0.05, angResolution = 0.02),
+            path,
+            0.0,
+            constraint,
+            constraint,
+        ).baseProfile
+
+        val max = maxTotalTankWheelVoltage(kinematics, path, profile)
         assertTrue(max > maxVoltage + 0.3, "max wheel voltage: $max")
     }
 }
