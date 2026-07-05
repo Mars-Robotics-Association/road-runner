@@ -1,5 +1,6 @@
 package com.acmerobotics.roadrunner
 
+import kotlin.math.abs
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.withSign
@@ -32,6 +33,55 @@ data class MotorFeedforward(
     fun compute(vel: Double, accel: Double) = kS.withSign(vel) + kV * vel + kA * accel
 
     fun compute(vel: DualNum<Time>) = compute(vel[0], vel[1])
+}
+
+/**
+ * @usesMathJax
+ *
+ * Direction-dependent motor feedforward for drives whose effective constants differ between axial and lateral
+ * chassis motion, as mecanum drives do (roller scrub raises the effective constants when strafing). Wheel velocity
+ * is decomposed into the component produced by axial and angular chassis motion and the component produced by
+ * lateral motion (see [MecanumKinematics.inverseComponents]); the [axial] constants apply to the former, the
+ * [lateral] constants to the latter, computing
+ * \(k_{s,blend} + k_{v,ax} u_{ax} + k_{v,lat} u_{lat} + k_{a,ax} \dot{u}_{ax} + k_{a,lat} \dot{u}_{lat}\)
+ * with \(k_{s,blend}\) the magnitude-weighted mean of the two kS values.
+ *
+ * The model reproduces [axial] exactly in pure forward/rotational motion and [lateral] exactly in pure strafing,
+ * interpolating between the two calibrated regimes in mixed motion. Angular motion is assigned the axial constants
+ * because rotation drives each wheel in its rolling direction; the scrub incurred during rotation is in truth
+ * somewhere between the two regimes. With equal [axial] and [lateral] constants, [compute] matches
+ * [MotorFeedforward.compute] on the total wheel velocity exactly.
+ */
+data class AnisotropicMotorFeedforward(
+    @JvmField
+    val axial: MotorFeedforward,
+    @JvmField
+    val lateral: MotorFeedforward,
+) {
+    /**
+     * Computes the kS contribution magnitude for a wheel moving with velocity components [axialVel], [lateralVel]:
+     * the magnitude-weighted mean of the axial and lateral kS values.
+     */
+    fun kSBlended(axialVel: Double, lateralVel: Double): Double {
+        val magSum = abs(axialVel) + abs(lateralVel)
+        return if (magSum < 1e-9) {
+            axial.kS
+        } else {
+            (axial.kS * abs(axialVel) + lateral.kS * abs(lateralVel)) / magSum
+        }
+    }
+
+    /**
+     * Computes the (normalized) voltage for a wheel whose velocity decomposes into [axialVel] (axial and angular
+     * chassis motion) and [lateralVel] (lateral chassis motion), with matching acceleration components.
+     */
+    fun compute(axialVel: Double, axialAccel: Double, lateralVel: Double, lateralAccel: Double) =
+        kSBlended(axialVel, lateralVel).withSign(axialVel + lateralVel) +
+            axial.kV * axialVel + lateral.kV * lateralVel +
+            axial.kA * axialAccel + lateral.kA * lateralAccel
+
+    fun compute(axialVel: DualNum<Time>, lateralVel: DualNum<Time>) =
+        compute(axialVel[0], axialVel[1], lateralVel[0], lateralVel[1])
 }
 
 /**

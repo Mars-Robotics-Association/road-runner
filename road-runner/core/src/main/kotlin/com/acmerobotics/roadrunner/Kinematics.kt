@@ -7,32 +7,57 @@ import kotlin.math.sqrt
 import kotlin.math.withSign
 
 /**
- * Intersects the profile acceleration intervals implied by the voltage budget of each wheel. Each [wheelVels] entry
- * gives the wheel velocity per unit profile velocity and its arclength derivative, so at profile velocity [vel] and
- * profile acceleration \(a\) the wheel velocity is \(u = c v\) and the wheel acceleration is
- * \(\dot{u} = c a + c' v^2\).
+ * Coefficients of one wheel's feedforward voltage as a function of the profile velocity \(v\) and profile
+ * acceleration \(a\): voltage \(= k_{S,signed} + b_v v + b_{v^2} v^2 + b_a a\). The coefficients derive from the
+ * wheel velocity per unit profile velocity and its arclength derivative, so at profile velocity \(v\) the wheel
+ * velocity is \(u = c v\) and the wheel acceleration is \(\dot{u} = c a + c' v^2\).
+ */
+private class WheelVoltageTerm(
+    @JvmField val kSSigned: Double,
+    @JvmField val velCoeff: Double,
+    @JvmField val velSqCoeff: Double,
+    @JvmField val accelCoeff: Double,
+)
+
+private fun wheelVoltageTerm(feedforward: MotorFeedforward, wheelVel: DualNum<Arclength>) =
+    WheelVoltageTerm(
+        feedforward.kS.withSign(wheelVel[0]),
+        feedforward.kV * wheelVel[0],
+        feedforward.kA * wheelVel[1],
+        feedforward.kA * wheelVel[0],
+    )
+
+private fun wheelVoltageTerm(
+    feedforward: AnisotropicMotorFeedforward,
+    axialVel: DualNum<Arclength>,
+    lateralVel: DualNum<Arclength>,
+) = WheelVoltageTerm(
+    feedforward.kSBlended(axialVel[0], lateralVel[0]).withSign(axialVel[0] + lateralVel[0]),
+    feedforward.axial.kV * axialVel[0] + feedforward.lateral.kV * lateralVel[0],
+    feedforward.axial.kA * axialVel[1] + feedforward.lateral.kA * lateralVel[1],
+    feedforward.axial.kA * axialVel[0] + feedforward.lateral.kA * lateralVel[0],
+)
+
+/**
+ * Intersects the profile acceleration intervals implied by the voltage budget of each wheel.
  */
 private fun minMaxProfileAccelForWheels(
-    feedforward: MotorFeedforward,
     maxVoltage: Double,
-    wheelVels: List<DualNum<Arclength>>,
+    terms: List<WheelVoltageTerm>,
     vel: Double,
 ): MinMax {
     var minAccel = Double.NEGATIVE_INFINITY
     var maxAccel = Double.POSITIVE_INFINITY
-    for (wheelVel in wheelVels) {
-        val c = wheelVel[0]
-        val cPrime = wheelVel[1]
-        if (abs(c) < 1e-9) {
-            // profile acceleration has no effect on a (locally) stationary wheel
+    for (term in terms) {
+        if (abs(term.accelCoeff) < 1e-9) {
+            // profile acceleration has no effect on this wheel's voltage
             continue
         }
 
         // the wheel voltage less the contribution of the profile acceleration
-        val partialVoltage = feedforward.kS.withSign(c) + feedforward.kV * c * vel +
-            feedforward.kA * cPrime * vel * vel
-        val bound1 = (-maxVoltage - partialVoltage) / (feedforward.kA * c)
-        val bound2 = (maxVoltage - partialVoltage) / (feedforward.kA * c)
+        val partialVoltage = term.kSSigned + term.velCoeff * vel + term.velSqCoeff * vel * vel
+        val bound1 = (-maxVoltage - partialVoltage) / term.accelCoeff
+        val bound2 = (maxVoltage - partialVoltage) / term.accelCoeff
         minAccel = max(minAccel, min(bound1, bound2))
         maxAccel = min(maxAccel, max(bound1, bound2))
     }
@@ -45,26 +70,34 @@ private fun minMaxProfileAccelForWheels(
  * velocity-constraint counterpart of [minMaxProfileAccelForWheels].
  */
 private fun maxProfileVelForWheels(
-    feedforward: MotorFeedforward,
     maxVoltage: Double,
-    wheelVels: List<DualNum<Arclength>>,
+    terms: List<WheelVoltageTerm>,
 ): Double {
     var maxVel = Double.POSITIVE_INFINITY
-    for (wheelVel in wheelVels) {
-        val c = wheelVel[0]
-        val cPrime = wheelVel[1]
-        val kSSigned = feedforward.kS.withSign(c)
-        // find where the cruise voltage kS + kV c v + kA c' v² first leaves [-V, V]
+    for (term in terms) {
+        // find where the cruise voltage kS + b_v v + b_v² v² first leaves [-V, V]
         maxVel = min(
             maxVel,
-            smallestPositiveRoot(feedforward.kA * cPrime, feedforward.kV * c, kSSigned - maxVoltage)
+            smallestPositiveRoot(term.velSqCoeff, term.velCoeff, term.kSSigned - maxVoltage)
         )
         maxVel = min(
             maxVel,
-            smallestPositiveRoot(feedforward.kA * cPrime, feedforward.kV * c, kSSigned + maxVoltage)
+            smallestPositiveRoot(term.velSqCoeff, term.velCoeff, term.kSSigned + maxVoltage)
         )
     }
     return maxVel
+}
+
+private fun requireValidVoltageParams(feedforward: MotorFeedforward, maxVoltage: Double, cruiseFraction: Double) {
+    require(feedforward.kV > 0.0) { "kV (${feedforward.kV}) must be positive" }
+    require(feedforward.kA > 0.0) { "kA (${feedforward.kA}) must be positive" }
+    require(feedforward.kS >= 0.0) { "kS (${feedforward.kS}) must be non-negative" }
+    require(cruiseFraction > 0.0 && cruiseFraction < 1.0) {
+        "cruiseFraction ($cruiseFraction) must be in (0, 1)"
+    }
+    require(maxVoltage * cruiseFraction > feedforward.kS) {
+        "maxVoltage ($maxVoltage) times cruiseFraction ($cruiseFraction) must exceed kS (${feedforward.kS})"
+    }
 }
 
 /**
@@ -161,6 +194,37 @@ data class MecanumKinematics @JvmOverloads constructor(
         t.linearVel.x + t.linearVel.y * lateralMultiplier + t.angVel * trackWidth,
     )
 
+    /**
+     * Wheel velocities decomposed by the chassis motion that produces them: [axial] holds the contribution of
+     * axial and angular motion (the wheel rolling in its drive direction), [lateral] the contribution of lateral
+     * motion (the strafe component that engages the rollers). Corresponding entries sum to [inverse].
+     */
+    data class WheelVelocityComponents<Param>(
+        @JvmField
+        val axial: WheelVelocities<Param>,
+        @JvmField
+        val lateral: WheelVelocities<Param>,
+    )
+
+    /**
+     * Like [inverse], but splits each wheel velocity into its axial+angular and lateral components for use with
+     * direction-dependent feedforward models (see [AnisotropicMotorFeedforward]).
+     */
+    fun <Param> inverseComponents(t: PoseVelocity2dDual<Param>) = WheelVelocityComponents(
+        WheelVelocities(
+            t.linearVel.x - t.angVel * trackWidth,
+            t.linearVel.x - t.angVel * trackWidth,
+            t.linearVel.x + t.angVel * trackWidth,
+            t.linearVel.x + t.angVel * trackWidth,
+        ),
+        WheelVelocities(
+            -t.linearVel.y * lateralMultiplier,
+            t.linearVel.y * lateralMultiplier,
+            -t.linearVel.y * lateralMultiplier,
+            t.linearVel.y * lateralMultiplier,
+        ),
+    )
+
     inner class WheelVelConstraint(@JvmField val maxWheelVel: Double) : VelConstraint {
         override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): Double {
             val txRobotWorld = robotPose.value().inverse()
@@ -187,32 +251,38 @@ data class MecanumKinematics @JvmOverloads constructor(
      *
      * The velocity limit only draws [cruiseFraction] of [maxVoltage] so that some acceleration always remains
      * available; without this reserve, reaching the voltage-limited top speed would take unbounded time.
+     *
+     * The [AnisotropicMotorFeedforward] form applies separate axial and lateral constants to the corresponding
+     * wheel velocity components (see [inverseComponents]), so strafe-heavy path segments are budgeted with the
+     * strafe-calibrated constants. The [MotorFeedforward] form applies one set of constants isotropically.
      */
     inner class WheelVoltageConstraint @JvmOverloads constructor(
-        @JvmField val feedforward: MotorFeedforward,
+        @JvmField val feedforward: AnisotropicMotorFeedforward,
         @JvmField val maxVoltage: Double,
         @JvmField val cruiseFraction: Double = 0.95,
     ) : VelConstraint, AccelConstraint {
+        @JvmOverloads constructor(
+            feedforward: MotorFeedforward,
+            maxVoltage: Double,
+            cruiseFraction: Double = 0.95,
+        ) : this(AnisotropicMotorFeedforward(feedforward, feedforward), maxVoltage, cruiseFraction)
+
         init {
-            require(feedforward.kV > 0.0) { "kV (${feedforward.kV}) must be positive" }
-            require(feedforward.kA > 0.0) { "kA (${feedforward.kA}) must be positive" }
-            require(feedforward.kS >= 0.0) { "kS (${feedforward.kS}) must be non-negative" }
-            require(cruiseFraction > 0.0 && cruiseFraction < 1.0) {
-                "cruiseFraction ($cruiseFraction) must be in (0, 1)"
-            }
-            require(maxVoltage * cruiseFraction > feedforward.kS) {
-                "maxVoltage ($maxVoltage) times cruiseFraction ($cruiseFraction) must exceed kS (${feedforward.kS})"
-            }
+            requireValidVoltageParams(feedforward.axial, maxVoltage, cruiseFraction)
+            requireValidVoltageParams(feedforward.lateral, maxVoltage, cruiseFraction)
         }
 
-        private fun wheelVels(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): List<DualNum<Arclength>> {
+        private fun voltageTerms(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): List<WheelVoltageTerm> {
             // the wheel acceleration term requires a second derivative of the pose
             val pose = if (robotPose.position.x.size() >= 3) robotPose else path[s, 3]
-            return inverse(pose.inverse() * pose.velocity()).all()
+            val components = inverseComponents(pose.inverse() * pose.velocity())
+            return components.axial.all().zip(components.lateral.all()).map { (axialVel, lateralVel) ->
+                wheelVoltageTerm(feedforward, axialVel, lateralVel)
+            }
         }
 
         override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double) =
-            maxProfileVelForWheels(feedforward, maxVoltage * cruiseFraction, wheelVels(robotPose, path, s))
+            maxProfileVelForWheels(maxVoltage * cruiseFraction, voltageTerms(robotPose, path, s))
 
         override fun minMaxProfileAccel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): MinMax =
             minMaxProfileAccel(robotPose, path, s, 0.0)
@@ -222,7 +292,7 @@ data class MecanumKinematics @JvmOverloads constructor(
             path: PosePath,
             s: Double,
             vel: Double
-        ): MinMax = minMaxProfileAccelForWheels(feedforward, maxVoltage, wheelVels(robotPose, path, s), vel)
+        ): MinMax = minMaxProfileAccelForWheels(maxVoltage, voltageTerms(robotPose, path, s), vel)
     }
 }
 
@@ -300,25 +370,17 @@ data class TankKinematics(@JvmField val trackWidth: Double) {
         @JvmField val cruiseFraction: Double = 0.95,
     ) : VelConstraint, AccelConstraint {
         init {
-            require(feedforward.kV > 0.0) { "kV (${feedforward.kV}) must be positive" }
-            require(feedforward.kA > 0.0) { "kA (${feedforward.kA}) must be positive" }
-            require(feedforward.kS >= 0.0) { "kS (${feedforward.kS}) must be non-negative" }
-            require(cruiseFraction > 0.0 && cruiseFraction < 1.0) {
-                "cruiseFraction ($cruiseFraction) must be in (0, 1)"
-            }
-            require(maxVoltage * cruiseFraction > feedforward.kS) {
-                "maxVoltage ($maxVoltage) times cruiseFraction ($cruiseFraction) must exceed kS (${feedforward.kS})"
-            }
+            requireValidVoltageParams(feedforward, maxVoltage, cruiseFraction)
         }
 
-        private fun wheelVels(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): List<DualNum<Arclength>> {
+        private fun voltageTerms(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): List<WheelVoltageTerm> {
             // the wheel acceleration term requires a second derivative of the pose
             val pose = if (robotPose.position.x.size() >= 3) robotPose else path[s, 3]
-            return inverse(pose.inverse() * pose.velocity()).all()
+            return inverse(pose.inverse() * pose.velocity()).all().map { wheelVoltageTerm(feedforward, it) }
         }
 
         override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double) =
-            maxProfileVelForWheels(feedforward, maxVoltage * cruiseFraction, wheelVels(robotPose, path, s))
+            maxProfileVelForWheels(maxVoltage * cruiseFraction, voltageTerms(robotPose, path, s))
 
         override fun minMaxProfileAccel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): MinMax =
             minMaxProfileAccel(robotPose, path, s, 0.0)
@@ -328,6 +390,6 @@ data class TankKinematics(@JvmField val trackWidth: Double) {
             path: PosePath,
             s: Double,
             vel: Double
-        ): MinMax = minMaxProfileAccelForWheels(feedforward, maxVoltage, wheelVels(robotPose, path, s), vel)
+        ): MinMax = minMaxProfileAccelForWheels(maxVoltage, voltageTerms(robotPose, path, s), vel)
     }
 }
