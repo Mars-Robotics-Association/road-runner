@@ -1,6 +1,7 @@
 package com.acmerobotics.roadrunner
 
 import kotlin.math.abs
+import kotlin.math.sign
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.withSign
@@ -82,6 +83,59 @@ data class AnisotropicMotorFeedforward(
 
     fun compute(axialVel: DualNum<Time>, lateralVel: DualNum<Time>) =
         compute(axialVel[0], axialVel[1], lateralVel[0], lateralVel[1])
+}
+
+/**
+ * @usesMathJax
+ *
+ * Feedforward for the parasitic yaw moment produced by chassis translation: the drivetrain asymmetry (motor
+ * constant tolerance, unequal wheel wear, friction varying with the weight distribution) that makes a robot curve
+ * left or right under straight open-loop driving. The asymmetry acts like a yaw disturbance proportional to
+ * translation speed, so the compensation is a yaw-mode voltage
+ * \(k_{s,ax} \operatorname{sign}(v_{ax}) + k_{v,ax} v_{ax} + k_{s,lat} \operatorname{sign}(v_{lat}) + k_{v,lat} v_{lat}\)
+ * computed from the *chassis* velocity (unlike [MotorFeedforward] and [AnisotropicMotorFeedforward], which take
+ * wheel velocities) and applied to the wheels with the signs of the angular column of the inverse kinematics
+ * (see [MecanumKinematics.yawCouplingVoltages]). Positive output demands a counterclockwise yaw moment. Each
+ * contribution vanishes with its source velocity: pure strafing incurs no axial-sourced correction and vice
+ * versa. The sign terms treat velocities within a small threshold of zero as zero so that numerical residue in a
+ * component that is zero by construction (e.g., lateral velocity while driving tangentially) cannot inject a
+ * spurious correction.
+ *
+ * The constants are identifiable with only a body-frame (e.g., dead-wheel) localizer, with no per-wheel
+ * encoders: during the forward ramp, regress the parasitic yaw rate \(\omega\) against forward velocity, and
+ * scale by the small-signal yaw plant gain \(k_v \cdot \mathrm{trackWidth}\) to convert to voltage. The slope
+ * gives [kVAxial] and the intercept [kSAxial]; the lateral ramp gives [kSLateral] and [kVLateral] likewise.
+ * Because the coupling is fit from the chassis-level response, it absorbs kinematic error (e.g., wheel toe)
+ * along with per-wheel constant mismatch; the constants describe the command-to-motion map, not any single
+ * motor.
+ */
+data class YawCouplingFeedforward @JvmOverloads constructor(
+    @JvmField
+    val kSAxial: Double,
+    @JvmField
+    val kVAxial: Double,
+    @JvmField
+    val kSLateral: Double = 0.0,
+    @JvmField
+    val kVLateral: Double = 0.0,
+) {
+    /**
+     * Computes the sign-dependent (kS) portion of the correction at chassis velocity ([axialVel], [lateralVel]).
+     * Velocity components within `1e-6` of zero contribute nothing.
+     */
+    fun computeKS(axialVel: Double, lateralVel: Double) =
+        kSAxial * thresholdSign(axialVel) + kSLateral * thresholdSign(lateralVel)
+
+    /**
+     * Computes the (normalized) yaw-mode voltage compensating the yaw disturbance at chassis velocity
+     * ([axialVel], [lateralVel]).
+     */
+    fun compute(axialVel: Double, lateralVel: Double) =
+        computeKS(axialVel, lateralVel) + kVAxial * axialVel + kVLateral * lateralVel
+
+    companion object {
+        private fun thresholdSign(x: Double) = if (abs(x) < 1e-6) 0.0 else sign(x)
+    }
 }
 
 /**

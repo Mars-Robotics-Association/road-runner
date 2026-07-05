@@ -88,6 +88,9 @@ private fun maxProfileVelForWheels(
     return maxVel
 }
 
+// signs of the angular column of the mecanum inverse kinematics, in [MecanumKinematics.WheelVelocities] order
+private val mecanumYawSigns = doubleArrayOf(-1.0, -1.0, 1.0, 1.0)
+
 private fun requireValidVoltageParams(feedforward: MotorFeedforward, maxVoltage: Double, cruiseFraction: Double) {
     require(feedforward.kV > 0.0) { "kV (${feedforward.kV}) must be positive" }
     require(feedforward.kA > 0.0) { "kA (${feedforward.kA}) must be positive" }
@@ -225,6 +228,17 @@ data class MecanumKinematics @JvmOverloads constructor(
         ),
     )
 
+    /**
+     * Per-wheel voltages realizing the yaw-mode correction of [coupling] at chassis velocity [vel]; add each to
+     * the corresponding wheel's base feedforward voltage. Entries follow [WheelVelocities] order and carry the
+     * signs of the angular column of [inverse], so the correction is a pure yaw moment (it cancels in the
+     * translational rows of [forward]).
+     */
+    fun yawCouplingVoltages(coupling: YawCouplingFeedforward, vel: PoseVelocity2d): List<Double> {
+        val yawVoltage = coupling.compute(vel.linearVel.x, vel.linearVel.y)
+        return mecanumYawSigns.map { it * yawVoltage }
+    }
+
     inner class WheelVelConstraint(@JvmField val maxWheelVel: Double) : VelConstraint {
         override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): Double {
             val txRobotWorld = robotPose.value().inverse()
@@ -255,12 +269,23 @@ data class MecanumKinematics @JvmOverloads constructor(
      * The [AnisotropicMotorFeedforward] form applies separate axial and lateral constants to the corresponding
      * wheel velocity components (see [inverseComponents]), so strafe-heavy path segments are budgeted with the
      * strafe-calibrated constants. The [MotorFeedforward] form applies one set of constants isotropically.
+     *
+     * The [yawCoupling] correction (see [YawCouplingFeedforward]) is included in each wheel's budgeted voltage
+     * with the signs of [yawCouplingVoltages], so a follower applying the correction at runtime stays within the
+     * budget the planner assumed.
      */
-    inner class WheelVoltageConstraint @JvmOverloads constructor(
+    inner class WheelVoltageConstraint(
         @JvmField val feedforward: AnisotropicMotorFeedforward,
+        @JvmField val yawCoupling: YawCouplingFeedforward,
         @JvmField val maxVoltage: Double,
         @JvmField val cruiseFraction: Double = 0.95,
     ) : VelConstraint, AccelConstraint {
+        @JvmOverloads constructor(
+            feedforward: AnisotropicMotorFeedforward,
+            maxVoltage: Double,
+            cruiseFraction: Double = 0.95,
+        ) : this(feedforward, YawCouplingFeedforward(0.0, 0.0), maxVoltage, cruiseFraction)
+
         @JvmOverloads constructor(
             feedforward: MotorFeedforward,
             maxVoltage: Double,
@@ -270,14 +295,45 @@ data class MecanumKinematics @JvmOverloads constructor(
         init {
             requireValidVoltageParams(feedforward.axial, maxVoltage, cruiseFraction)
             requireValidVoltageParams(feedforward.lateral, maxVoltage, cruiseFraction)
+            require(abs(yawCoupling.kVAxial) < feedforward.axial.kV) {
+                "yaw coupling kVAxial (${yawCoupling.kVAxial}) must be smaller in magnitude than " +
+                    "axial kV (${feedforward.axial.kV})"
+            }
+            require(abs(yawCoupling.kVLateral) < feedforward.lateral.kV) {
+                "yaw coupling kVLateral (${yawCoupling.kVLateral}) must be smaller in magnitude than " +
+                    "lateral kV (${feedforward.lateral.kV})"
+            }
+            require(
+                maxVoltage * cruiseFraction >
+                    max(feedforward.axial.kS, feedforward.lateral.kS) +
+                    abs(yawCoupling.kSAxial) + abs(yawCoupling.kSLateral)
+            ) {
+                "maxVoltage ($maxVoltage) times cruiseFraction ($cruiseFraction) must exceed kS plus the " +
+                    "yaw coupling kS magnitudes"
+            }
         }
 
         private fun voltageTerms(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double): List<WheelVoltageTerm> {
             // the wheel acceleration term requires a second derivative of the pose
             val pose = if (robotPose.position.x.size() >= 3) robotPose else path[s, 3]
-            val components = inverseComponents(pose.inverse() * pose.velocity())
-            return components.axial.all().zip(components.lateral.all()).map { (axialVel, lateralVel) ->
-                wheelVoltageTerm(feedforward, axialVel, lateralVel)
+            val vel = pose.inverse() * pose.velocity()
+            val components = inverseComponents(vel)
+
+            // chassis velocity components scale with the (nonnegative) profile velocity, so the coupling voltage
+            // is affine in it: the sign terms join kS and the linear terms join the velocity coefficient
+            val axialDir = vel.linearVel.x[0]
+            val lateralDir = vel.linearVel.y[0]
+            val yawKS = yawCoupling.computeKS(axialDir, lateralDir)
+            val yawKV = yawCoupling.kVAxial * axialDir + yawCoupling.kVLateral * lateralDir
+
+            return components.axial.all().zip(components.lateral.all()).mapIndexed { i, (axialVel, lateralVel) ->
+                val base = wheelVoltageTerm(feedforward, axialVel, lateralVel)
+                WheelVoltageTerm(
+                    base.kSSigned + mecanumYawSigns[i] * yawKS,
+                    base.velCoeff + mecanumYawSigns[i] * yawKV,
+                    base.velSqCoeff,
+                    base.accelCoeff,
+                )
             }
         }
 
