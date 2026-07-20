@@ -34,11 +34,16 @@ dependencies {
 
 kotlin {
     compilerOptions {
+        // Pin to 17: Android Studio's bundled JBR is often JDK 21, and Kotlin 1.9.0
+        // does not support jvmTarget 21 ("Unknown Kotlin JVM target: 21").
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
         freeCompilerArgs.set(listOf("-Xjvm-default=all"))
     }
 }
 
 java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
     withSourcesJar()
 }
 

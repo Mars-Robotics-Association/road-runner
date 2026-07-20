@@ -29,11 +29,16 @@ dependencies {
 }
 
 java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
     withSourcesJar()
 }
 
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
     kotlinOptions {
+        // Pin to 17: Android Studio's bundled JBR is often JDK 21, and Kotlin 1.9.0
+        // does not support jvmTarget 21 ("Unknown Kotlin JVM target: 21").
+        jvmTarget = "17"
         // compile interface default methods (e.g., the velocity-aware AccelConstraint method) to JVM default
         // methods so that Java implementations inherit them
         freeCompilerArgs += "-Xjvm-default=all"
