@@ -3,14 +3,13 @@ import java.net.URI
 val libVersion: String by rootProject.extra
 
 plugins {
-    id("org.jetbrains.kotlin.jvm") version "1.9.0"
+    id("org.jetbrains.kotlin.jvm") version "2.1.10"
 
     `java-library`
 
-    id("org.jetbrains.dokka") version "1.9.10"
+    id("org.jetbrains.dokka") version "1.9.20"
 
-    id("org.jlleitschuh.gradle.ktlint") version "10.2.1"
-    id("org.jlleitschuh.gradle.ktlint-idea") version "10.2.1"
+    id("org.jlleitschuh.gradle.ktlint") version "12.1.2"
 
     `maven-publish`
 }
@@ -34,10 +33,9 @@ dependencies {
 
 kotlin {
     compilerOptions {
-        // Pin to 17: Android Studio's bundled JBR is often JDK 21, and Kotlin 1.9.0
-        // does not support jvmTarget 21 ("Unknown Kotlin JVM target: 21").
+        // Pin to 17: Android Studio's bundled JBR is often JDK 21.
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
-        freeCompilerArgs.set(listOf("-Xjvm-default=all"))
+        freeCompilerArgs.add("-Xjvm-default=all")
     }
 }
 
