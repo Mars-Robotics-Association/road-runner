@@ -35,6 +35,21 @@ class AnisotropicFeedforwardTest {
     private val maxVoltage = 12.0
 
     @Test
+    fun testLinearBlendAcrossWheelReversal() {
+        val ff = anisoFf.copy(friction = LinearBlendFriction(2.0))
+        for ((speed, fraction) in listOf(-3.0 to -1.0, -1.0 to -0.5, 0.0 to 0.0, 1.0 to 0.5, 3.0 to 1.0)) {
+            val axial = 4.0
+            val lateral = speed - axial
+            val dynamicVoltage = axialFf.kV * axial + lateralFf.kV * lateral + lateralFf.kA
+            assertEquals(
+                ff.kSBlended(axial, lateral) * fraction + dynamicVoltage,
+                ff.compute(axial, 0.0, lateral, 1.0),
+                1e-12,
+            )
+        }
+    }
+
+    @Test
     fun testStribeckReversalAndSlidingFriction() {
         val curve = StribeckFriction(stictionSpeed = 2.0, peakRatio = 1.5)
         for (direction in listOf(-1.0, 1.0)) {

@@ -36,19 +36,37 @@ data class MotorFeedforward(
     fun compute(vel: DualNum<Time>) = compute(vel[0], vel[1])
 }
 
+/** Signed wheel friction voltage. The planner budgets up to [peakRatio] times the sliding voltage. */
+sealed interface WheelFriction {
+    val peakRatio: Double
+    fun voltage(slidingVoltage: Double, wheelSpeed: Double): Double
+}
+
+/** Linearly blends from -kS to +kS over [-vBlend, +vBlend] in commanded wheel-speed units. */
+data class LinearBlendFriction(val vBlend: Double) : WheelFriction {
+    init {
+        require(vBlend.isFinite() && vBlend > 0) { "vBlend must be finite and positive" }
+    }
+
+    override val peakRatio: Double get() = 1.0
+
+    override fun voltage(slidingVoltage: Double, wheelSpeed: Double) =
+        slidingVoltage * (wheelSpeed / vBlend).coerceIn(-1.0, 1.0)
+}
+
 /**
  * Drake's continuous Stribeck approximation adapted to wheel feedforward voltage.
  * [stictionSpeed] is in commanded wheel-speed units. [peakRatio] is breakaway voltage
  * divided by sliding friction voltage (the fitted kS). A ratio of one only smooths reversal.
  * See https://drake.mit.edu/doxygen_cxx/group__mbp__continuous.html
  */
-data class StribeckFriction @JvmOverloads constructor(val stictionSpeed: Double, val peakRatio: Double = 1.0) {
+data class StribeckFriction @JvmOverloads constructor(val stictionSpeed: Double, override val peakRatio: Double = 1.0) : WheelFriction {
     init {
         require(stictionSpeed.isFinite() && stictionSpeed > 0)
         require(peakRatio.isFinite() && peakRatio >= 1)
     }
 
-    fun voltage(slidingVoltage: Double, wheelSpeed: Double): Double {
+    override fun voltage(slidingVoltage: Double, wheelSpeed: Double): Double {
         val speed = abs(wheelSpeed) / stictionSpeed
         val factor = when {
             speed < 1 -> peakRatio * smoothStep(speed)
@@ -84,7 +102,7 @@ data class AnisotropicMotorFeedforward @JvmOverloads constructor(
     @JvmField
     val lateral: MotorFeedforward,
     @JvmField
-    val friction: StribeckFriction? = null,
+    val friction: WheelFriction? = null,
 ) {
     /**
      * Computes the kS contribution magnitude for a wheel moving with velocity components [axialVel], [lateralVel]:
