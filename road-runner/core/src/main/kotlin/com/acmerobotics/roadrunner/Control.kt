@@ -37,6 +37,31 @@ data class MotorFeedforward(
 }
 
 /**
+ * Drake's continuous Stribeck approximation adapted to wheel feedforward voltage.
+ * [stictionSpeed] is in commanded wheel-speed units. [peakRatio] is breakaway voltage
+ * divided by sliding friction voltage (the fitted kS). A ratio of one only smooths reversal.
+ * See https://drake.mit.edu/doxygen_cxx/group__mbp__continuous.html
+ */
+data class StribeckFriction @JvmOverloads constructor(val stictionSpeed: Double, val peakRatio: Double = 1.0) {
+    init {
+        require(stictionSpeed.isFinite() && stictionSpeed > 0)
+        require(peakRatio.isFinite() && peakRatio >= 1)
+    }
+
+    fun voltage(slidingVoltage: Double, wheelSpeed: Double): Double {
+        val speed = abs(wheelSpeed) / stictionSpeed
+        val factor = when {
+            speed < 1 -> peakRatio * smoothStep(speed)
+            speed < 3 -> 1 + (peakRatio - 1) * smoothStep((3 - speed) / 2)
+            else -> 1.0
+        }
+        return slidingVoltage * factor * sign(wheelSpeed)
+    }
+
+    private fun smoothStep(x: Double) = x * x * x * (10 + x * (6 * x - 15))
+}
+
+/**
  * @usesMathJax
  *
  * Direction-dependent motor feedforward for drives whose effective constants differ between axial and lateral
@@ -47,17 +72,19 @@ data class MotorFeedforward(
  * \(k_{s,blend} + k_{v,ax} u_{ax} + k_{v,lat} u_{lat} + k_{a,ax} \dot{u}_{ax} + k_{a,lat} \dot{u}_{lat}\)
  * with \(k_{s,blend}\) the magnitude-weighted mean of the two kS values.
  *
- * The model reproduces [axial] exactly in pure forward/rotational motion and [lateral] exactly in pure strafing,
+ * With the default signed kS model, the feedforward reproduces [axial] exactly in pure forward/rotational motion and [lateral] exactly in pure strafing,
  * interpolating between the two calibrated regimes in mixed motion. Angular motion is assigned the axial constants
  * because rotation drives each wheel in its rolling direction; the scrub incurred during rotation is in truth
  * somewhere between the two regimes. With equal [axial] and [lateral] constants, [compute] matches
  * [MotorFeedforward.compute] on the total wheel velocity exactly.
  */
-data class AnisotropicMotorFeedforward(
+data class AnisotropicMotorFeedforward @JvmOverloads constructor(
     @JvmField
     val axial: MotorFeedforward,
     @JvmField
     val lateral: MotorFeedforward,
+    @JvmField
+    val friction: StribeckFriction? = null,
 ) {
     /**
      * Computes the kS contribution magnitude for a wheel moving with velocity components [axialVel], [lateralVel]:
@@ -76,10 +103,14 @@ data class AnisotropicMotorFeedforward(
      * Computes the (normalized) voltage for a wheel whose velocity decomposes into [axialVel] (axial and angular
      * chassis motion) and [lateralVel] (lateral chassis motion), with matching acceleration components.
      */
-    fun compute(axialVel: Double, axialAccel: Double, lateralVel: Double, lateralAccel: Double) =
-        kSBlended(axialVel, lateralVel).withSign(axialVel + lateralVel) +
+    fun compute(axialVel: Double, axialAccel: Double, lateralVel: Double, lateralAccel: Double): Double {
+        val kS = kSBlended(axialVel, lateralVel)
+        val wheelSpeed = axialVel + lateralVel
+        val frictionVoltage = friction?.voltage(kS, wheelSpeed) ?: kS.withSign(wheelSpeed)
+        return frictionVoltage +
             axial.kV * axialVel + lateral.kV * lateralVel +
             axial.kA * axialAccel + lateral.kA * lateralAccel
+    }
 
     fun compute(axialVel: DualNum<Time>, lateralVel: DualNum<Time>) =
         compute(axialVel[0], axialVel[1], lateralVel[0], lateralVel[1])

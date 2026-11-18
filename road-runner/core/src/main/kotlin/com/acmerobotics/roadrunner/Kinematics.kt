@@ -308,7 +308,7 @@ data class MecanumKinematics @JvmOverloads constructor(
             }
             require(
                 maxVoltage * cruiseFraction >
-                    max(feedforward.axial.kS, feedforward.lateral.kS) +
+                    max(feedforward.axial.kS, feedforward.lateral.kS) * (feedforward.friction?.peakRatio ?: 1.0) +
                     abs(yawCoupling.kSAxial) + abs(yawCoupling.kSLateral)
             ) {
                 "maxVoltage ($maxVoltage) times cruiseFraction ($cruiseFraction) must exceed kS plus the " +
@@ -329,15 +329,32 @@ data class MecanumKinematics @JvmOverloads constructor(
             val yawKS = yawCoupling.computeKS(axialDir, lateralDir)
             val yawKV = yawCoupling.kVAxial * axialDir + yawCoupling.kVLateral * lateralDir
 
-            return components.axial.all().zip(components.lateral.all()).mapIndexed { i, (axialVel, lateralVel) ->
+            val terms = mutableListOf<WheelVoltageTerm>()
+            for ((i, pair) in components.axial.all().zip(components.lateral.all()).withIndex()) {
+                val (axialVel, lateralVel) = pair
                 val base = wheelVoltageTerm(feedforward, axialVel, lateralVel)
-                WheelVoltageTerm(
-                    base.kSSigned + mecanumYawSigns[i] * yawKS,
-                    base.velCoeff + mecanumYawSigns[i] * yawKV,
-                    base.velSqCoeff,
-                    base.accelCoeff,
-                )
+                val yawOffset = mecanumYawSigns[i] * yawKS
+                fun addTerm(frictionVoltage: Double) {
+                    terms.add(WheelVoltageTerm(
+                        frictionVoltage + yawOffset,
+                        base.velCoeff + mecanumYawSigns[i] * yawKV,
+                        base.velSqCoeff,
+                        base.accelCoeff,
+                    ))
+                }
+                val friction = feedforward.friction
+                if (friction == null) {
+                    addTerm(base.kSSigned)
+                } else {
+                    // Bound both ends of the friction range. Voltage is affine in friction,
+                    // so this covers the interior Stribeck peak even between profile samples.
+                    addTerm(0.0)
+                    if (axialVel[0] + lateralVel[0] != 0.0) {
+                        addTerm(base.kSSigned * friction.peakRatio)
+                    }
+                }
             }
+            return terms
         }
 
         override fun maxRobotVel(robotPose: Pose2dDual<Arclength>, path: PosePath, s: Double) =

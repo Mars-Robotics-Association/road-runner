@@ -35,6 +35,32 @@ class AnisotropicFeedforwardTest {
     private val maxVoltage = 12.0
 
     @Test
+    fun testStribeckReversalAndSlidingFriction() {
+        val curve = StribeckFriction(stictionSpeed = 2.0, peakRatio = 1.5)
+        for (direction in listOf(-1.0, 1.0)) {
+            for ((v, volts) in listOf(0.0 to 0.0, 1.0 to 0.75, 2.0 to 1.5, 4.0 to 1.25, 8.0 to 1.0)) {
+                assertEquals(direction * volts, curve.voltage(1.0, direction * v), 1e-12)
+            }
+        }
+        val ff = anisoFf.copy(friction = curve)
+        // Opposing components leave zero wheel speed, but still require dynamic voltage.
+        assertEquals(4 * (axialFf.kV - lateralFf.kV) + axialFf.kA, ff.compute(4.0, 1.0, -4.0, 0.0), 1e-12)
+    }
+
+    @Test
+    fun testStribeckProfileRespectsBudget() {
+        val ff = anisoFf.copy(friction = StribeckFriction(3.0, 3.0))
+        val path = strafePath()
+        val kinematics = MecanumKinematics(12.0)
+        val constraint = kinematics.WheelVoltageConstraint(ff, maxVoltage)
+        val planned = profile(
+            TEST_PROFILE_PARAMS.copy(dispResolution = 0.05, angResolution = 0.02),
+            path, 0.0, constraint, constraint,
+        ).baseProfile
+        assertTrue(maxAnisotropicWheelVoltage(kinematics, path, planned, ff) < maxVoltage + 0.1)
+    }
+
+    @Test
     fun testComputeReducesToIsotropic() {
         val ff = AnisotropicMotorFeedforward(axialFf, axialFf)
         val r = Random(0x5f3759df)
@@ -116,6 +142,7 @@ class AnisotropicFeedforwardTest {
         kinematics: MecanumKinematics,
         path: PosePath,
         p: DisplacementProfile,
+        ff: AnisotropicMotorFeedforward = anisoFf,
     ): Double {
         val traj = DisplacementTrajectory(path, p)
         var maxWheelVoltage = 0.0
@@ -123,7 +150,7 @@ class AnisotropicFeedforwardTest {
             val txWorldRobot = traj[s]
             val components = kinematics.inverseComponents(txWorldRobot.inverse() * txWorldRobot.velocity())
             components.axial.all().zip(components.lateral.all()) { axialVel, lateralVel ->
-                maxWheelVoltage = maxOf(maxWheelVoltage, abs(anisoFf.compute(axialVel, lateralVel)))
+                maxWheelVoltage = maxOf(maxWheelVoltage, abs(ff.compute(axialVel, lateralVel)))
             }
         }
         return maxWheelVoltage
